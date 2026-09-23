@@ -22,6 +22,7 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import (
+    GraphCaptureContext,
     get_pp_group,
     graph_capture,
     is_global_first_rank,
@@ -139,6 +140,7 @@ class CudaGraphManager:
         self.graphs: dict[BatchExecutionDescriptor, torch.cuda.CUDAGraph] = {}
         self.pool = current_platform.get_global_graph_pool() if cudagraph_mode else None
 
+        self.capture_context: GraphCaptureContext | None = None
         self._graphs_captured = False
 
         # Profiling hooks, set only by profile_cudagraph_memory() below: cap
@@ -328,7 +330,10 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
-        with graph_capture(device=self.device):
+        with graph_capture(
+            device=self.device, graph_capture_context=self.capture_context
+        ) as capture_context:
+            self.capture_context = capture_context
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.

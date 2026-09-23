@@ -150,6 +150,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
+from vllm.v1.worker.gpu.spec_decode.mtp.speculator import MTPSpeculator
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     get_max_chunk_logits,
@@ -943,7 +944,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 if self.speculator is not None:
                     with use_workspace_lane(self._draft_workspace_lane):
-                        self.speculator.capture()
+                        if isinstance(self.speculator, MTPSpeculator):
+                            self.speculator.capture(self.cudagraph_manager)
+                        else:
+                            self.speculator.capture()
                 if self.adaptive_verification is not None:
                     with self.step_timing.collect() as timings:
                         for batch in self.adaptive_verification.batches_to_profile(

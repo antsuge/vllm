@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import torch
 import torch.nn as nn
 
+from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
@@ -11,6 +13,27 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+
+    def capture(self, target_manager: CudaGraphManager | None = None) -> None:
+        if target_manager is None or target_manager.capture_context is None:
+            super().capture()
+            return
+
+        # Target and MTP replay sequentially; only dead temporaries may alias.
+        # A shared pool alone cannot reuse native allocator blocks on another
+        # stream. Keep input preparation and every bucket on the target stream.
+        for manager in (
+            self.prefill_cudagraph_manager,
+            self.decode_cudagraph_manager,
+        ):
+            assert manager is not None
+            manager.pool = target_manager.pool
+            manager.capture_context = target_manager.capture_context
+
+        stream = target_manager.capture_context.stream
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            super().capture()
 
     def load_draft_model(
         self,
