@@ -228,6 +228,127 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize(
+    "seq_lens",
+    [
+        [(4, 4)],
+        [(8, 8)],
+        [(4, 257)],
+        [(8, 4097)],
+        [(9, 4097)],
+        [(4, 513), (4, 257)],
+        [(1, 31), (3, 513), (4, 257)],
+        [(8, 262080)],
+    ],
+)
+@pytest.mark.parametrize("scratch_capacity", [4, 16])
+@pytest.mark.parametrize("block_size", [16, 544])
+def test_small_query_split_kv_matches_causal_attention(
+    seq_lens, scratch_capacity, block_size
+):
+    """Cover masked segments and fallback when query tokens exceed scratch space."""
+    test_triton_unified_attn(
+        seq_lens=seq_lens,
+        num_heads=(8, 2),
+        head_size=256,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=block_size,
+        soft_cap=None,
+        num_blocks=max(
+            32, (max(kv for _, kv in seq_lens) + block_size - 1) // block_size
+        ),
+        q_dtype=None,
+        seq_threshold_3D=scratch_capacity,
+    )
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(80),
+    reason="FA2 small-query experiment targets A100",
+)
+@pytest.mark.parametrize("query_len", [1, 2, 4, 8, 9])
+@pytest.mark.parametrize("splits", [16, 128])
+@pytest.mark.parametrize("block_size", [16, 544])
+@torch.inference_mode()
+def test_fa2_small_query_graph_replays_with_growing_context(
+    query_len, splits, block_size
+):
+    """The selected path must honor updated KV lengths and leave padding untouched."""
+    from vllm.config import VllmConfig, set_current_vllm_config
+    from vllm.config.attention import AttentionConfig
+    from vllm.v1.attention.backends.flash_attn import (
+        FlashAttentionImpl,
+        FlashAttentionMetadata,
+    )
+
+    torch.set_default_device("cuda")
+    set_random_seed(42)
+    heads, kv_heads, dim, max_length = 8, 2, 256, 4097
+    blocks = (max_length + block_size - 1) // block_size
+    cache = torch.randn(blocks, kv_heads, block_size, 2 * dim, dtype=torch.bfloat16)
+    k, v = cache.transpose(1, 2).split(dim, dim=-1)
+    query = torch.randn(query_len + 3, heads, dim, dtype=torch.bfloat16)
+    output = torch.full_like(query, float("nan"))
+    table = torch.arange(blocks, dtype=torch.int32).unsqueeze(0)
+    seq_lens = torch.tensor([257], dtype=torch.int32)
+    metadata = FlashAttentionMetadata(
+        num_actual_tokens=query_len,
+        max_query_len=query_len,
+        query_start_loc=torch.tensor([0, query_len], dtype=torch.int32),
+        max_seq_len=max_length,
+        seq_lens=seq_lens,
+        block_table=table,
+        slot_mapping=torch.arange(query_len, dtype=torch.int64),
+        use_cascade=False,
+        common_prefix_len=0,
+        cu_prefix_query_lens=None,
+        prefix_kv_lens=None,
+        suffix_kv_lens=None,
+    )
+    config = VllmConfig(
+        attention_config=AttentionConfig(
+            flash_attn_version=2, fa2_small_query_splits=splits
+        )
+    )
+    with set_current_vllm_config(config):
+        impl = FlashAttentionImpl(
+            num_heads=heads,
+            head_size=dim,
+            scale=dim**-0.5,
+            num_kv_heads=kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+        )
+    layer = torch.nn.Module()
+    for name in ("_q_scale", "_k_scale", "_v_scale"):
+        layer.register_buffer(name, torch.ones((), dtype=torch.float32))
+
+    def forward():
+        impl.forward(layer, query, k, v, cache, metadata, output)
+
+    forward()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        forward()
+    for length in (257, max_length):
+        seq_lens.fill_(length)
+        graph.replay()
+        ref = ref_paged_attn(
+            query[:query_len].clone(),
+            k.contiguous(),
+            v.contiguous(),
+            [query_len],
+            [length],
+            table,
+            dim**-0.5,
+        )
+        torch.testing.assert_close(output[:query_len], ref, atol=1.5e-2, rtol=1e-2)
+        assert torch.isnan(output[query_len:]).all()
+
+
+@pytest.mark.parametrize(
     "seq_lens", [[(1, 1328), (5, 18), (129, 463)], [(1, 523), (1, 37), (1, 2011)]]
 )
 @pytest.mark.parametrize("num_heads", NUM_HEADS)

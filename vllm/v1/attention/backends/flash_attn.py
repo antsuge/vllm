@@ -871,6 +871,14 @@ class FlashAttentionImpl(AttentionImpl):
 
         self.attn_type = attn_type
         vllm_config = get_current_vllm_config_or_none()
+        self.fa2_small_query_splits = (
+            vllm_config.attention_config.fa2_small_query_splits
+            if vllm_config is not None
+            else 0
+        )
+        self._fa2_small_query_buffers: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None
+        ) = None
         uses_kv_cache = attn_type not in (
             AttentionType.ENCODER,
             AttentionType.ENCODER_ONLY,
@@ -1034,6 +1042,67 @@ class FlashAttentionImpl(AttentionImpl):
             # queries are quantized in the attention layer
             key_cache = key_cache.view(current_platform.fp8_dtype())
             value_cache = value_cache.view(current_platform.fp8_dtype())
+
+        if (
+            self.fa2_small_query_splits
+            and self.vllm_flash_attn_version == 2
+            and self.head_size == 256
+            and self.num_heads == 8
+            and self.num_kv_heads == 2
+            and query.dtype == key_cache.dtype == value_cache.dtype == torch.bfloat16
+            and self.dcp_world_size == 1
+            and not self.batch_invariant_enabled
+            and not attn_metadata.use_cascade
+            and attn_metadata.causal is True
+            and 1 < attn_metadata.max_query_len <= 8
+            and num_actual_tokens <= 8
+            and self.sliding_window == (-1, -1)
+            and self.alibi_slopes is None
+            and self.sinks is None
+            and self.logits_soft_cap == 0
+            and attn_metadata.mm_prefix_query_range_tensor is None
+            and attn_metadata.rswa_prefix_lens is None
+        ):
+            from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+
+            splits = self.fa2_small_query_splits
+            if self._fa2_small_query_buffers is None:
+                # Persist across graph captures and replays; indexed by query token.
+                shape = (8, self.num_heads, splits)
+                self._fa2_small_query_buffers = (
+                    torch.empty(
+                        (*shape, self.head_size),
+                        dtype=torch.float32,
+                        device=query.device,
+                    ),
+                    torch.empty(shape, dtype=torch.float32, device=query.device),
+                    torch.empty(shape, dtype=torch.float32, device=query.device),
+                )
+            partial, maxima, sums = self._fa2_small_query_buffers
+            unified_attention(
+                q=query[:num_actual_tokens],
+                k=key_cache,
+                v=value_cache,
+                out=output[:num_actual_tokens],
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                seqused_k=attn_metadata.seq_lens,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_seq_len,
+                softmax_scale=self.scale,
+                causal=True,
+                window_size=(-1, -1),
+                block_table=attn_metadata.block_table,
+                softcap=0,
+                q_descale=None,
+                k_descale=None,
+                v_descale=None,
+                seq_threshold_3D=8,
+                num_par_softmax_segments=splits,
+                softmax_segm_output=partial,
+                softmax_segm_max=maxima,
+                softmax_segm_expsum=sums,
+            )
+            return output
 
         if not attn_metadata.use_cascade:
             cu_seqlens_q = attn_metadata.query_start_loc

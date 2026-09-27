@@ -45,6 +45,9 @@ class AttentionConfig:
     flash_attn_max_num_splits_for_cuda_graph: int = 32
     """Flash Attention max number splits for cuda graph decode."""
 
+    fa2_small_query_splits: Literal[0, 16, 32, 64, 128] = 0
+    """Opt-in split-KV for BF16 hd256 small-query FA2 attention; 0 disables it."""
+
     tq_max_kv_splits_for_cuda_graph: int = 32
     """TurboQuant max NUM_KV_SPLITS for cuda graph decode.
     Fixes the split count so grid dimensions are constant across captures,
